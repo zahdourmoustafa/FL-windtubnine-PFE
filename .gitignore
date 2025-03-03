@@ -1,0 +1,31 @@
+# Data directories
+data/
+datasets/
+raw_data/
+output/
+__pycache__/
+# Images and media files
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+*.mov
+
+# Large files
+*.zip
+*.tar
+*.gz
+*.rar
+*.7z
+
+# Model files
+*.h5
+*.pkl
+*.pth
+*.onnx
+
+# Cache and temporary files
+__pycache__/
+*.pyc
+.ipynb_checkpoints/

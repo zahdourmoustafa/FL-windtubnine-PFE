@@ -1,0 +1,9 @@
+# Add your project dependencies here, for example:
+numpy
+pandas
+scikit-learn
+matplotlib
+tensorflow
+scipy
+torch
+# Add other packages as needed
