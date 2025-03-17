@@ -3,10 +3,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class GearboxCNNLSTM(nn.Module):
-    def __init__(self, input_channels=9, window_size=256, lstm_hidden_size=32, num_lstm_layers=1, num_sensors=8):
+    def __init__(self, input_channels=9, window_size=256, lstm_hidden_size=32, num_lstm_layers=1, num_sensors=8, dropout_rate=0.3):
         super().__init__()
         self.num_samples = 0
         self.num_sensors = num_sensors
+        self.dropout_rate = dropout_rate
+        self.mc_dropout = False  # Flag for Monte Carlo dropout during inference
         
         # Sensor-specific feature extraction
         self.sensor_cnns = nn.ModuleList([
@@ -14,6 +16,7 @@ class GearboxCNNLSTM(nn.Module):
                 nn.Conv1d(1, 8, kernel_size=5, padding=2),
                 nn.BatchNorm1d(8),
                 nn.ReLU(),
+                nn.Dropout(dropout_rate/2),  # Add dropout to CNNs
                 nn.MaxPool1d(4)
             ) for _ in range(num_sensors)
         ])
@@ -23,6 +26,7 @@ class GearboxCNNLSTM(nn.Module):
             nn.Conv1d(1, 8, kernel_size=5, padding=2),
             nn.BatchNorm1d(8),
             nn.ReLU(),
+            nn.Dropout(dropout_rate/2),  # Add dropout to RPM processing
             nn.MaxPool1d(4)
         )
         
@@ -32,6 +36,7 @@ class GearboxCNNLSTM(nn.Module):
         # Sensor attention mechanism
         self.sensor_attention = nn.Sequential(
             nn.Linear(8 * 16, 32),
+            nn.Dropout(dropout_rate),  # Add dropout to attention
             nn.Tanh(),
             nn.Linear(32, 1)
         )
@@ -42,12 +47,13 @@ class GearboxCNNLSTM(nn.Module):
             hidden_size=lstm_hidden_size,
             num_layers=num_lstm_layers,
             bidirectional=True,
-            dropout=0.4 if num_lstm_layers > 1 else 0
+            dropout=dropout_rate if num_lstm_layers > 1 else 0
         )
         
         # Temporal attention
         self.temporal_attention = nn.Sequential(
             nn.Linear(lstm_hidden_size*2, 16),
+            nn.Dropout(dropout_rate),  # Add dropout to attention
             nn.Tanh(),
             nn.Linear(16, 1)
         )
@@ -56,7 +62,7 @@ class GearboxCNNLSTM(nn.Module):
         self.fault_detector = nn.Sequential(
             nn.Linear(lstm_hidden_size*2, 32),
             nn.ReLU(),
-            nn.Dropout(0.5),
+            nn.Dropout(dropout_rate),  # Increased dropout
             nn.Linear(32, 1)
         )
         
@@ -65,7 +71,7 @@ class GearboxCNNLSTM(nn.Module):
             nn.Sequential(
                 nn.Linear(lstm_hidden_size*2, 32),
                 nn.ReLU(),
-                nn.Dropout(0.3),
+                nn.Dropout(dropout_rate),  # Increased dropout
                 nn.Linear(32, 1),
                 nn.Sigmoid()
             ) for _ in range(num_sensors)
@@ -88,8 +94,23 @@ class GearboxCNNLSTM(nn.Module):
                 elif 'bias' in name:
                     nn.init.zeros_(param)
     
+    def enable_mc_dropout(self):
+        """Enable Monte Carlo dropout for inference uncertainty estimation"""
+        self.mc_dropout = True
+    
+    def disable_mc_dropout(self):
+        """Disable Monte Carlo dropout (normal inference mode)"""
+        self.mc_dropout = False
+    
     def forward(self, x):
         batch_size = x.size(0)
+        
+        # Set all dropout layers to training mode for MC dropout if enabled
+        if self.mc_dropout:
+            def apply_dropout_training(m):
+                if isinstance(m, nn.Dropout):
+                    m.train()
+            self.apply(apply_dropout_training)
         
         # Split input into sensor data and RPM
         sensor_data = x[:, :, :self.num_sensors]  # (batch_size, time_steps, num_sensors)
@@ -141,7 +162,10 @@ class GearboxCNNLSTM(nn.Module):
         context = torch.sum(temporal_weights * lstm_out, dim=1)
         
         # Generate predictions
-        fault_detection = torch.sigmoid(self.fault_detector(context))
+        fault_detection = self.fault_detector(context)
+        # Only apply sigmoid in evaluation mode, as training now uses BCEWithLogitsLoss
+        if not self.training and not self.mc_dropout:
+            fault_detection = torch.sigmoid(fault_detection)
         
         # Generate sensor-wise anomaly scores
         sensor_anomalies = torch.cat([

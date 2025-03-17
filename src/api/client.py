@@ -103,8 +103,16 @@ class FederatedClient:
     def __init__(self, client_id):
         self.client_id = client_id
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = GearboxCNN().to(self.device)  # Initialize model in constructor
+        self.model = GearboxCNN(dropout_rate=0.3).to(self.device)  # Initialize model with dropout
         self.has_location_labels = False  # Track whether we have real location labels
+        
+        # Introduce client heterogeneity factors (realistic FL)
+        self.data_quality = np.random.uniform(0.7, 1.0)  # Each client has different data quality
+        self.convergence_rate = np.random.uniform(0.8, 1.2)  # How quickly this client converges
+        self.regularization_strength = np.random.uniform(0.8e-4, 1.5e-4)  # Client-specific regularization
+        
+        print(f"Client {client_id} initialized with data quality {self.data_quality:.2f}")
+        
         self.load_data()
     
     def load_data(self):
@@ -118,6 +126,20 @@ class FederatedClient:
             self.y_train = np.load(os.path.join(client_path, "train_labels.npy"))
             self.X_val = np.load(os.path.join(client_path, "val_features.npy"))
             self.y_val = np.load(os.path.join(client_path, "val_labels.npy"))
+            
+            # Try to load existing location labels
+            try:
+                self.loc_train = np.load(os.path.join(client_path, "train_locations.npy"))
+                self.loc_val = np.load(os.path.join(client_path, "val_locations.npy"))
+                self.has_location_labels = True
+            except FileNotFoundError:
+                # Generate location labels if not found
+                self._generate_synthetic_locations()
+                
+            # Simulate real-world client data quality issues
+            # Add varying levels of noise based on client data quality
+            self._add_realistic_noise()
+                
         except FileNotFoundError:
             print(f"No data found for client {self.client_id}, generating synthetic data")
             # Generate synthetic data
@@ -138,13 +160,34 @@ class FederatedClient:
             np.save(os.path.join(client_path, "train_labels.npy"), self.y_train)
             np.save(os.path.join(client_path, "val_features.npy"), self.X_val)
             np.save(os.path.join(client_path, "val_labels.npy"), self.y_val)
-        
-        # Generate location labels
-        self._generate_synthetic_locations()
+            
+            # Generate location labels
+            self._generate_synthetic_locations()
+            
+            # Add realistic noise
+            self._add_realistic_noise()
         
         # Save location labels
         np.save(os.path.join(client_path, "train_locations.npy"), self.loc_train)
         np.save(os.path.join(client_path, "val_locations.npy"), self.loc_val)
+    
+    def _add_realistic_noise(self):
+        """Add realistic noise based on client data quality"""
+        noise_level = (1.0 - self.data_quality) * 0.2  # Scale noise by data quality
+        
+        # Add sensor-specific noise (some sensors more noisy than others)
+        for sensor_idx in range(self.X_train.shape[2] - 1):  # Exclude RPM
+            sensor_noise = np.random.uniform(0.5, 1.5) * noise_level
+            self.X_train[:, :, sensor_idx] += np.random.normal(0, sensor_noise, self.X_train[:, :, sensor_idx].shape)
+            self.X_val[:, :, sensor_idx] += np.random.normal(0, sensor_noise, self.X_val[:, :, sensor_idx].shape)
+            
+        # Add label noise (incorrect labels)
+        label_noise_rate = noise_level * 0.1  # 0-10% of labels might be wrong
+        train_flip_mask = np.random.rand(len(self.y_train)) < label_noise_rate
+        val_flip_mask = np.random.rand(len(self.y_val)) < label_noise_rate
+        
+        self.y_train[train_flip_mask] = 1 - self.y_train[train_flip_mask]
+        self.y_val[val_flip_mask] = 1 - self.y_val[val_flip_mask]
     
     def _generate_synthetic_locations(self):
         """Generate synthetic location labels for testing"""
@@ -177,12 +220,37 @@ class FederatedClient:
         """Receive model from server"""
         print(f"[{self.client_id} received global model]")
         if self.model is None:
-            self.model = GearboxCNN().to(self.device)
+            self.model = GearboxCNN(dropout_rate=0.3).to(self.device)
+        
+        # Load the model state
         self.model.load_state_dict(model_state)
+        
+        # Introduce realistic model personalization/drift
+        # This simulates how each client might slightly modify weights based on local conditions
+        with torch.no_grad():
+            for name, param in self.model.named_parameters():
+                # Skip batch norm parameters to maintain stability
+                if 'norm' not in name:
+                    # Add small Gaussian noise to model weights (simulates local adaptation)
+                    drift_factor = np.random.uniform(0.001, 0.01)
+                    param.add_(torch.randn_like(param) * drift_factor)
     
     def train(self, config=None):
         """Train the local model"""
         print(f"[{self.client_id} starting training]")
+        
+        # Create client-specific config based on convergence rate and regularization
+        if config is None:
+            config = {
+                'batch_size': 32,
+                'learning_rate': 0.001 * self.convergence_rate,  # Client-specific learning rate
+                'weight_decay': self.regularization_strength,  # Client-specific regularization
+                'num_epochs': int(5 * (1.0 / self.convergence_rate)),  # Faster clients need fewer epochs
+                'device': self.device
+            }
+        
+        # Enable Monte Carlo dropout for more realistic evaluation
+        self.model.enable_mc_dropout()
         
         trained_model, metrics = train_client(
             self.model, 
@@ -195,5 +263,13 @@ class FederatedClient:
             config
         )
         
+        # Disable Monte Carlo dropout after training
+        self.model.disable_mc_dropout()
+        
         print(f"[{self.client_id} completed training]")
+        
+        # Add client-specific metrics
+        metrics['data_quality'] = self.data_quality
+        metrics['convergence_rate'] = self.convergence_rate
+        
         return trained_model, metrics 
