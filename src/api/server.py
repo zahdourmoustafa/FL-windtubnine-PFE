@@ -35,20 +35,56 @@ class FederatedServer:
         print("Server initialized")
         print(f"Initialized {num_clients} clients\n")
     
-    def aggregate_models(self, client_models):
-        """Aggregate client models using FedAvg"""
+    def aggregate_models(self, client_models, client_metrics):
+        """Aggregate client models using weighted FedAvg based on performance metrics"""
         print(f"\n[Server aggregating {len(client_models)} client models]")
         
-        # Perform FedAvg
+        # Compute weights based on client metrics
+        # Higher AUC, better data quality, and lower loss get higher weights
+        weights = []
+        for i, metrics in enumerate(client_metrics):
+            # Extract key metrics: detection AUC, data quality, and validation loss
+            auc = metrics.get('detection_auc', 0.5)  # Default to 0.5 if not available
+            data_quality = metrics.get('data_quality', 0.5)  # Default to 0.5 if not available
+            val_loss = metrics.get('val_loss', 1.0)  # Default to 1.0 if not available
+            
+            # Calculate weight based on metrics (normalize loss to be higher for lower loss)
+            loss_factor = 1.0 / (val_loss + 0.1)  # Add small epsilon to avoid division by zero
+            
+            # Compute combined weight
+            weight = (auc * 0.5) + (data_quality * 0.3) + (loss_factor * 0.2)
+            weights.append(weight)
+        
+        # Normalize weights to sum to 1.0
+        total_weight = sum(weights)
+        if total_weight > 0:
+            normalized_weights = [w / total_weight for w in weights]
+        else:
+            # Equal weights if all weights are zero
+            normalized_weights = [1.0 / len(weights) for _ in weights]
+        
+        print(f"Client weights: {[f'{w:.3f}' for w in normalized_weights]}")
+        
+        # Memory retention of previous global model (prevents catastrophic forgetting)
+        memory_retention = 0.2  # Keep 20% of the old model
+        
+        # Perform weighted FedAvg
         global_state = self.global_model.state_dict()
         for key in global_state.keys():
-            # Stack parameters from all clients and convert to float for averaging
-            stacked_params = torch.stack([client_models[i].state_dict()[key].float() for i in range(len(client_models))], 0)
-            # Calculate mean and convert back to original dtype
-            global_state[key] = stacked_params.mean(0).to(global_state[key].dtype)
+            # Initialize with memory retention of previous global model
+            global_state[key] = global_state[key] * memory_retention
+            
+            # Add weighted contributions from client models
+            for i, client_model in enumerate(client_models):
+                # Convert to float for precision in averaging
+                client_param = client_model.state_dict()[key].float()
+                global_state[key] += (1.0 - memory_retention) * normalized_weights[i] * client_param
+            
+            # Convert back to original dtype
+            global_state[key] = global_state[key].to(global_state[key].dtype)
         
         self.global_model.load_state_dict(global_state)
-        print("[Server completed model aggregation]")
+        print("[Server completed weighted model aggregation with memory retention]")
         return self.global_model
     
     def evaluate_global_model(self):
@@ -144,7 +180,7 @@ class FederatedServer:
                     print(f"{sensor}: Mean Anomaly = {sensor_metrics['mean_anomaly']:.4f}, AUC = {sensor_metrics['anomaly_auc']:.4f}")
             
             # Aggregate models and update global model
-            self.global_model = self.aggregate_models(client_models)
+            self.global_model = self.aggregate_models(client_models, metrics_list)
             
             # Evaluate global model
             metrics = self.evaluate_global_model()

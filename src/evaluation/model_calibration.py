@@ -1,218 +1,195 @@
 import torch
 import numpy as np
-import matplotlib.pyplot as plt
-from src.models.model import GearboxCNNLSTM as GearboxCNN
-from config.config import *
 import os
-import scipy.io
+import sys
+import matplotlib.pyplot as plt
+from sklearn.metrics import precision_recall_curve, auc, roc_curve, f1_score, precision_score, recall_score
 import argparse
 
-def load_data(dataset_name):
-    """Load and prepare data from a specific dataset"""
-    file_path = os.path.join(DATA_PATH, f"{dataset_name}.mat")
+# Add the project root directory to the Python path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+
+# Import the model and other utilities
+from src.models.model import GearboxCNNLSTM
+from config.config import *
+
+def load_calibration_data():
+    """Load validation data for threshold calibration"""
+    # Load processed validation data from the last client
+    val_data_path = os.path.join(OUTPUT_PATH, "client_2_val_data.npy")
+    val_labels_path = os.path.join(OUTPUT_PATH, "client_2_val_labels.npy")
     
     try:
-        data = scipy.io.loadmat(file_path)
-        print(f"Loading {dataset_name} dataset")
-    except Exception as e:
-        raise Exception(f"Error loading {file_path}: {e}")
-    
-    # Extract sensor data and RPM
-    sensor_data = np.vstack([data[f'AN{i}'].flatten() for i in range(3, 11)]).T
-    rpm_data = data['Speed'].reshape(-1, 1)
-    combined_data = np.hstack([sensor_data, rpm_data])
-    
-    # Create windows
-    windows = []
-    step = WINDOW_SIZE - OVERLAP
-    for start in range(0, combined_data.shape[0] - WINDOW_SIZE + 1, step):
-        windows.append(combined_data[start:start+WINDOW_SIZE])
-    windows = np.array(windows)
-    
-    # Load global normalization stats
-    mean = np.load(os.path.join(GLOBAL_STATS_PATH, "global_mean.npy"))
-    std = np.load(os.path.join(GLOBAL_STATS_PATH, "global_std.npy"))
-    
-    # Normalize data
-    normalized_windows = (windows - mean) / std
-    
-    return normalized_windows
+        X_val = np.load(val_data_path)
+        y_val = np.load(val_labels_path)
+        print(f"Loaded validation data: {X_val.shape}, labels: {y_val.shape}")
+        return X_val, y_val
+    except FileNotFoundError:
+        print("Error: Validation data not found! Run training first.")
+        return None, None
 
-def get_model_outputs(model, data_samples):
-    """Get raw model outputs for data samples"""
-    device = next(model.parameters()).device
+def calibrate_threshold(model, X_val, y_val, output_dir=None):
+    """Find the optimal threshold for fault detection balancing precision and recall"""
+    if output_dir is None:
+        output_dir = os.path.join(BASE_DIR, "output", "plots")
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
     model.eval()
-    all_outputs = []
+    
+    print(f"Running calibration on {len(X_val)} validation samples...")
     
     with torch.no_grad():
+        # Convert data to PyTorch tensors
+        val_data = torch.FloatTensor(X_val).to(device)
+        val_labels = y_val
+        
+        # Get predictions
         batch_size = 64
-        for i in range(0, len(data_samples), batch_size):
-            batch = torch.FloatTensor(data_samples[i:i+batch_size]).to(device)
-            outputs = model(batch).squeeze().cpu().numpy()
-            all_outputs.extend(outputs)
-    
-    return np.array(all_outputs)
-
-def find_optimal_threshold(healthy_outputs, damaged_outputs):
-    """Find the optimal threshold to separate healthy and damaged samples"""
-    min_healthy = np.min(healthy_outputs)
-    max_healthy = np.max(healthy_outputs)
-    min_damaged = np.min(damaged_outputs)
-    max_damaged = np.max(damaged_outputs)
-    
-    print(f"Healthy output range: {min_healthy:.3f} - {max_healthy:.3f}")
-    print(f"Damaged output range: {min_damaged:.3f} - {max_damaged:.3f}")
-    
-    # Try different threshold values
-    thresholds = np.linspace(0.5, 0.95, 10)
-    results = []
-    
-    for threshold in thresholds:
-        # Calculate metrics
-        healthy_accuracy = np.mean(healthy_outputs < threshold) * 100
-        damaged_accuracy = np.mean(damaged_outputs >= threshold) * 100
-        balanced_accuracy = (healthy_accuracy + damaged_accuracy) / 2
+        all_probs = []
         
-        results.append({
-            'threshold': threshold,
-            'healthy_accuracy': healthy_accuracy,
-            'damaged_accuracy': damaged_accuracy,
-            'balanced_accuracy': balanced_accuracy
-        })
+        for i in range(0, len(val_data), batch_size):
+            batch = val_data[i:i+batch_size]
+            outputs = model(batch)
+            probs = torch.sigmoid(outputs['fault_detection']).cpu().numpy().flatten()
+            all_probs.extend(probs)
         
-        print(f"Threshold {threshold:.2f}: Healthy Acc={healthy_accuracy:.1f}%, "
-              f"Damaged Acc={damaged_accuracy:.1f}%, Balanced={balanced_accuracy:.1f}%")
+        all_probs = np.array(all_probs)
     
-    # Find best threshold
-    best_threshold = max(results, key=lambda x: x['balanced_accuracy'])
-    print(f"\nBest threshold: {best_threshold['threshold']:.3f} with "
-          f"balanced accuracy: {best_threshold['balanced_accuracy']:.1f}%")
+    # Calculate precision-recall curve
+    precision, recall, thresholds = precision_recall_curve(val_labels, all_probs)
     
-    return best_threshold['threshold']
-
-def visualize_distributions(healthy_outputs, damaged_outputs, threshold=None):
-    """Visualize the output distributions of healthy and damaged samples"""
-    plt.figure(figsize=(12, 6))
+    # Calculate F1 scores for each threshold
+    f1_scores = []
+    for i in range(len(precision)):
+        if i < len(thresholds):
+            # Use the threshold to make predictions
+            preds = (all_probs >= thresholds[i]).astype(int)
+            f1 = f1_score(val_labels, preds)
+            f1_scores.append(f1)
+        else:
+            # For the last point, use a very high threshold
+            f1_scores.append(0)
     
-    # Plot histograms
-    plt.hist(healthy_outputs, bins=30, alpha=0.5, label='Healthy', color='green')
-    plt.hist(damaged_outputs, bins=30, alpha=0.5, label='Damaged', color='red')
+    # Find thresholds meeting minimum recall requirement
+    valid_idx = []
+    for i, r in enumerate(recall):
+        if r >= MIN_RECALL and i < len(thresholds):
+            valid_idx.append(i)
     
-    # Add threshold line if provided
-    if threshold is not None:
-        plt.axvline(x=threshold, color='black', linestyle='--', 
-                   label=f'Threshold ({threshold:.3f})')
+    if len(valid_idx) > 0:
+        # Find threshold with best F1 score among those with sufficient recall
+        valid_f1_scores = [f1_scores[i] for i in valid_idx]
+        best_idx = valid_idx[np.argmax(valid_f1_scores)]
+        optimal_threshold = thresholds[best_idx]
+        best_precision = precision[best_idx]
+        best_recall = recall[best_idx]
+        best_f1 = max(valid_f1_scores)
+    else:
+        # Use a low threshold to prioritize recall if none meet the minimum
+        optimal_threshold = DEFAULT_THRESHOLD
+        # Calculate metrics at this threshold
+        preds = (all_probs >= optimal_threshold).astype(int)
+        best_precision = precision_score(val_labels, preds)
+        best_recall = recall_score(val_labels, preds)
+        best_f1 = f1_score(val_labels, preds)
+        
+        print(f"Warning: No threshold found with recall >= {MIN_RECALL}")
+        print(f"Using default threshold of {optimal_threshold} with recall {best_recall:.4f}")
     
-    plt.xlabel('Model Output')
-    plt.ylabel('Count')
-    plt.title('Distribution of Model Outputs')
-    plt.legend()
+    # Save optimal threshold
+    np.save(os.path.join(output_dir, "optimal_threshold.npy"), optimal_threshold)
     
-    # Create output directory if it doesn't exist
-    os.makedirs('output/plots', exist_ok=True)
-    plt.savefig('output/plots/model_output_distributions.png')
-    print("Saved distribution visualization to output/plots/model_output_distributions.png")
-
-def create_calibration_curve(model, healthy_datasets, damaged_datasets):
-    """Create and save model calibration curves"""
-    # Load data
-    healthy_samples = []
-    for dataset in healthy_datasets:
-        try:
-            samples = load_data(dataset)
-            healthy_samples.append(samples)
-            print(f"Loaded {len(samples)} samples from {dataset}")
-        except Exception as e:
-            print(f"Could not load {dataset}: {e}")
-    
-    damaged_samples = []
-    for dataset in damaged_datasets:
-        try:
-            samples = load_data(dataset)
-            damaged_samples.append(samples)
-            print(f"Loaded {len(samples)} samples from {dataset}")
-        except Exception as e:
-            print(f"Could not load {dataset}: {e}")
-    
-    if not healthy_samples or not damaged_samples:
-        print("Error: Need at least one healthy and one damaged dataset")
-        return
-    
-    healthy_data = np.concatenate(healthy_samples)
-    damaged_data = np.concatenate(damaged_samples)
-    
-    # Get model outputs
-    healthy_outputs = get_model_outputs(model, healthy_data)
-    damaged_outputs = get_model_outputs(model, damaged_data)
-    
-    # Find optimal threshold
-    optimal_threshold = find_optimal_threshold(healthy_outputs, damaged_outputs)
-    
-    # Visualize distributions
-    visualize_distributions(healthy_outputs, damaged_outputs, optimal_threshold)
-    
-    # Create and save threshold-to-accuracy mapping
+    # Plot precision-recall curve
     plt.figure(figsize=(10, 6))
-    thresholds = np.linspace(0.1, 0.9, 50)
-    healthy_accs = []
-    damaged_accs = []
-    balanced_accs = []
+    plt.plot(recall, precision, label=f'Precision-Recall curve (AUC = {auc(recall, precision):.3f})')
+    plt.scatter([best_recall], [best_precision], color='red', s=100, zorder=10, 
+                label=f'Optimal threshold = {optimal_threshold:.3f}')
     
-    for threshold in thresholds:
-        healthy_acc = np.mean(healthy_outputs < threshold) * 100
-        damaged_acc = np.mean(damaged_outputs >= threshold) * 100
-        balanced_acc = (healthy_acc + damaged_acc) / 2
-        
-        healthy_accs.append(healthy_acc)
-        damaged_accs.append(damaged_acc)
-        balanced_accs.append(balanced_acc)
+    # Add the minimum recall line
+    plt.axvline(x=MIN_RECALL, color='orange', linestyle='--', 
+               label=f'Minimum recall = {MIN_RECALL}')
     
-    plt.plot(thresholds, healthy_accs, label='Healthy Accuracy', color='green')
-    plt.plot(thresholds, damaged_accs, label='Damaged Accuracy', color='red')
-    plt.plot(thresholds, balanced_accs, label='Balanced Accuracy', color='blue')
-    plt.axvline(x=optimal_threshold, color='black', linestyle='--', 
-               label=f'Optimal Threshold ({optimal_threshold:.3f})')
-    
-    plt.xlabel('Threshold')
-    plt.ylabel('Accuracy (%)')
-    plt.title('Classification Accuracy vs Threshold')
+    plt.title('Precision-Recall Curve with Optimal Threshold')
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
     plt.legend()
-    plt.grid(True, alpha=0.3)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.savefig(os.path.join(output_dir, "precision_recall_curve.png"))
     
-    # Create output directory if it doesn't exist
-    os.makedirs('output/plots', exist_ok=True)
-    plt.savefig('output/plots/threshold_calibration.png')
-    print("Saved threshold calibration curve to output/plots/threshold_calibration.png")
+    # Plot ROC curve
+    fpr, tpr, _ = roc_curve(val_labels, all_probs)
+    plt.figure(figsize=(10, 6))
+    plt.plot(fpr, tpr, label=f'ROC curve (AUC = {auc(fpr, tpr):.3f})')
+    plt.plot([0, 1], [0, 1], 'k--')
+    plt.title('ROC Curve')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.savefig(os.path.join(output_dir, "roc_curve.png"))
     
-    # Save the optimal threshold
-    np.save("output/plots/optimal_threshold.npy", optimal_threshold)
-    print(f"Saved optimal threshold ({optimal_threshold:.3f}) to output/plots/optimal_threshold.npy")
+    # Plot threshold vs F1 curve
+    plt.figure(figsize=(10, 6))
+    plt.plot(thresholds, f1_scores[:-1])  # Exclude the last point which doesn't have a threshold
+    plt.axvline(x=optimal_threshold, color='red', linestyle='--', 
+               label=f'Optimal threshold = {optimal_threshold:.3f}')
+    plt.title('F1 Score vs Threshold')
+    plt.xlabel('Threshold')
+    plt.ylabel('F1 Score')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.savefig(os.path.join(output_dir, "f1_vs_threshold.png"))
+    
+    # Plot threshold distribution histogram
+    plt.figure(figsize=(10, 6))
+    plt.hist(all_probs, bins=50, alpha=0.7)
+    plt.axvline(x=optimal_threshold, color='red', linestyle='--', 
+               label=f'Optimal threshold = {optimal_threshold:.3f}')
+    plt.title('Prediction Score Distribution')
+    plt.xlabel('Fault Probability')
+    plt.ylabel('Count')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.savefig(os.path.join(output_dir, "score_distribution.png"))
+    
+    print(f"\nCalibration Results:")
+    print(f"Optimal threshold: {optimal_threshold:.4f}")
+    print(f"Precision: {best_precision:.4f}")
+    print(f"Recall: {best_recall:.4f}")
+    print(f"F1 Score: {best_f1:.4f}")
+    print(f"\nCalibration plots saved to {output_dir}")
     
     return optimal_threshold
 
 def main():
-    parser = argparse.ArgumentParser(description='Calibrate model thresholds')
-    parser.add_argument('--healthy', nargs='+', default=['H1', 'H6'], 
-                        help='List of healthy datasets')
-    parser.add_argument('--damaged', nargs='+', default=['D1', 'D2'], 
-                        help='List of damaged datasets')
+    parser = argparse.ArgumentParser(description="Calibrate model threshold for optimal performance")
+    parser.add_argument("--output_dir", type=str, default=None, 
+                        help="Directory to save calibration results")
     args = parser.parse_args()
     
-    # Load model
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = GearboxCNN().to(device)
-    try:
-        model.load_state_dict(torch.load("best_global_model.pth", map_location=device))
-        print("Successfully loaded best_global_model.pth")
-    except FileNotFoundError:
-        print("Error: best_global_model.pth not found!")
+    # Load validation data
+    X_val, y_val = load_calibration_data()
+    if X_val is None or y_val is None:
         return
     
-    # Perform calibration
-    optimal_threshold = create_calibration_curve(model, args.healthy, args.damaged)
+    # Load the model
+    model = GearboxCNNLSTM()
+    try:
+        model_path = os.path.join(BASE_DIR, "final_model.pth")
+        model.load_state_dict(torch.load(model_path))
+        print(f"Loaded model from {model_path}")
+    except FileNotFoundError:
+        print(f"Error: final_model.pth not found! Run training first.")
+        return
     
-    print(f"\nRecommended command to use the calibrated threshold:")
-    print(f"python test_unseen_data.py --dataset H6 --threshold {optimal_threshold}")
+    # Calibrate threshold
+    optimal_threshold = calibrate_threshold(model, X_val, y_val, args.output_dir)
+    
+    print(f"\nCalibration complete. When testing, use:\n")
+    print(f"python -m src.evaluation.test_unseen_data --dataset YOUR_DATASET --threshold {optimal_threshold:.4f}")
 
 if __name__ == "__main__":
-    main()
+    main() 

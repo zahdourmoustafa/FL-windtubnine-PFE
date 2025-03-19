@@ -41,3 +41,12 @@ NUM_LSTM_LAYERS = 1
 # New federation parameters
 MIN_IMPROVEMENT = 0.1
 WARMUP_ROUNDS = 5
+
+# Loss function parameters
+LOCATION_LOSS_WEIGHT = 0.6
+FOCAL_GAMMA = 2.0          # Controls focus on hard examples in focal loss
+POS_WEIGHT = 5.0           # Weight for positive examples to address class imbalance
+
+# Detection threshold parameters
+DEFAULT_THRESHOLD = 0.1    # Lower threshold for higher recall
+MIN_RECALL = 0.5           # Minimum recall to aim for in threshold calibration
