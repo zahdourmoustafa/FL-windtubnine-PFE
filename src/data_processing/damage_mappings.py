@@ -93,14 +93,14 @@ DIAGNOSTIC_RULES = [
 # Sensor sensitivity adjustments - some sensors require different thresholds
 # to accurately detect anomalies (based on empirical testing)
 SENSOR_SENSITIVITY = {
-    "AN3": 1.0,    # Default sensitivity
-    "AN4": 0.85,   # More sensitive threshold (85% of default)
-    "AN5": 1.0,    # Default
-    "AN6": 0.9,    # More sensitive 
-    "AN7": 0.85,   # More sensitive
-    "AN8": 0.9,    # More sensitive
-    "AN9": 0.9,    # More sensitive
-    "AN10": 0.95   # Slightly more sensitive
+    "AN3": 0.85,   # More sensitive (was 1.0)
+    "AN4": 0.75,   # Significantly more sensitive (was 0.85)
+    "AN5": 0.85,   # More sensitive (was 1.0)
+    "AN6": 0.8,    # More sensitive (was 0.9)
+    "AN7": 0.8,    # More sensitive (was 0.85)
+    "AN8": 0.8,    # More sensitive (was 0.9)
+    "AN9": 0.85,   # More sensitive (was 0.9)
+    "AN10": 0.85   # More sensitive (was 0.95)
 }
 
 # Define correlations between sensor signals and failure modes

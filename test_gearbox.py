@@ -30,6 +30,7 @@ Examples:
   python test_gearbox.py data/unseen_data/H5.mat
   python test_gearbox.py D3 --threshold 0.4 --adaptive
   python test_gearbox.py D2 --full_scan --output ./my_analysis
+  python test_gearbox.py unseenD.mat --all_sensors
         """
     )
     
@@ -80,6 +81,18 @@ Examples:
         "--full_scan",
         action="store_true",
         help="Enable comprehensive scan to detect subtle damages"
+    )
+    
+    parser.add_argument(
+        "--enhanced_detection",
+        action="store_true",
+        help="Enable enhanced detection mode with very sensitive thresholds"
+    )
+    
+    parser.add_argument(
+        "--all_sensors",
+        action="store_true",
+        help="Special mode to detect subtle damage in all sensors when fault probability is high"
     )
     
     parser.add_argument(
@@ -135,6 +148,24 @@ def main():
         dataset_name = os.path.splitext(os.path.basename(dataset_path))[0]
         output_dir = os.path.join(BASE_DIR, "output", "analysis", f"{dataset_name}_{timestamp}")
     
+    # Apply enhanced detection mode if requested (overrides other settings)
+    if args.enhanced_detection:
+        args.adaptive = True
+        args.no_mc = False  # Ensure MC dropout is enabled
+        args.full_scan = True
+        # Use a higher threshold to prevent false positives
+        args.sensor_threshold = 0.4  # More conservative threshold (was 0.3)
+        print("\n⚠️  ENHANCED DETECTION MODE ENABLED - Using statistical validation to prevent false positives")
+        
+    # Apply all_sensors mode (highest priority) if requested
+    if args.all_sensors:
+        args.adaptive = True
+        args.no_mc = False
+        args.full_scan = True
+        args.enhanced_detection = True
+        args.sensor_threshold = 0.05  # Very low threshold to detect subtle patterns
+        print("\n⚠️  ALL SENSORS MODE ENABLED - Detecting subtle damage patterns in all sensors")
+    
     # Load damage classifier if requested
     damage_clf = None
     if not args.no_classify:
@@ -154,6 +185,10 @@ def main():
     print(f"  Adaptive Thresholds: {'Enabled' if args.adaptive else 'Disabled'}")
     print(f"  Monte Carlo Dropout: {'Disabled' if args.no_mc else 'Enabled'}")
     print(f"  Full Scan Mode: {'Enabled' if args.full_scan else 'Disabled'}")
+    if args.enhanced_detection:
+        print(f"  Enhanced Detection: Enabled")
+    if args.all_sensors:
+        print(f"  All Sensors Mode: Enabled")
     print(f"  Output Format: {args.format}")
     print(f"  Output Directory: {output_dir}")
     if args.model:
@@ -173,7 +208,9 @@ def main():
             detection_threshold=args.threshold,
             adaptive_threshold=args.adaptive,
             use_mc_dropout=not args.no_mc,
-            full_scan=args.full_scan
+            full_scan=args.full_scan,
+            enhanced_detection=args.enhanced_detection,
+            all_sensors_mode=args.all_sensors
         )
         
         # Apply supervised classifier if available
