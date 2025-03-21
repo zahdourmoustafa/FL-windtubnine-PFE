@@ -1,0 +1,15 @@
+        
+        # Get both types of anomaly scores if available
+        if 'joint_anomalies' in outputs and 'traditional_anomalies' in outputs:
+            # Use the enhanced model outputs
+            joint_anomalies = outputs['joint_anomalies']
+            traditional_anomalies = outputs['traditional_anomalies']
+            sensor_anomalies = outputs['sensor_anomalies']  # This is the calibrated ensemble
+        else:
+            # Backward compatibility with older model
+            sensor_anomalies = outputs['sensor_anomalies']
+            joint_anomalies = sensor_anomalies
+            traditional_anomalies = sensor_anomalies
+            
+        fault_label = targets['fault_label']
+        

@@ -155,6 +155,22 @@ def prepare_client_data(healthy_file, damaged_file, client_name):
     Prepare data for a client with fault location information - simulating client-side processing
     """
     try:
+        print(f"Starting preprocessing for {client_name} using {healthy_file} and {damaged_file}...")
+        
+        # Check if the files exist
+        healthy_path = os.path.join(DATA_PATH, healthy_file)
+        damaged_path = os.path.join(DATA_PATH, damaged_file)
+        
+        if not os.path.exists(healthy_path):
+            print(f"ERROR: Healthy file not found at {healthy_path}")
+            return False
+            
+        if not os.path.exists(damaged_path):
+            print(f"ERROR: Damaged file not found at {damaged_path}")
+            return False
+            
+        print(f"Found input files for {client_name}, proceeding with processing...")
+        
         # Create necessary directories for this client
         client_dir = os.path.join(OUTPUT_PATH, client_name)
         os.makedirs(client_dir, exist_ok=True)
@@ -188,9 +204,17 @@ def simulate_federated_preprocessing():
     client1_success = prepare_client_data("H1.mat", "D1.mat", "Client_1")
     client2_success = prepare_client_data("H2.mat", "D2.mat", "Client_2")
     
+    # Process data for additional clients 3, 4, and 5
+    client3_success = prepare_client_data("H3.mat", "D3.mat", "Client_3")
+    client4_success = prepare_client_data("H4.mat", "D4.mat", "Client_4")
+    client5_success = prepare_client_data("H5.mat", "D5.mat", "Client_5")
+    
     print("\nPreprocessing summary:")
     print(f"Client_1 preprocessing: {'Successful' if client1_success else 'Failed'}")
     print(f"Client_2 preprocessing: {'Successful' if client2_success else 'Failed'}")
+    print(f"Client_3 preprocessing: {'Successful' if client3_success else 'Failed'}")
+    print(f"Client_4 preprocessing: {'Successful' if client4_success else 'Failed'}")
+    print(f"Client_5 preprocessing: {'Successful' if client5_success else 'Failed'}")
 
 if __name__ == "__main__":
     # Simulate federated preprocessing where each client processes independently

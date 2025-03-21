@@ -6,4 +6,6 @@ matplotlib
 tensorflow
 scipy
 torch
+termcolor
+tabulate
 # Add other packages as needed

@@ -7,7 +7,7 @@ from config.config import DEFAULT_THRESHOLD, MIN_RECALL
 
 class FaultLocalizationLoss(nn.Module):
     def __init__(self, alpha=0.7, label_smoothing=0.05, num_sensors=8, min_faulty_sensors=3, 
-                 focal_gamma=2.0, pos_weight=3.0):
+                 focal_gamma=2.0, pos_weight=3.0, sensor_coupling_weight=0.3):
         super().__init__()
         self.alpha = alpha
         # Use BCEWithLogitsLoss with positive weight for handling class imbalance
@@ -17,7 +17,19 @@ class FaultLocalizationLoss(nn.Module):
         self.min_faulty_sensors = min_faulty_sensors
         self.focal_gamma = focal_gamma  # Focal loss gamma parameter
         self.pos_weight = pos_weight    # Weight for positive examples
-        # Remove coupling logic - each sensor will be treated independently
+        self.sensor_coupling_weight = sensor_coupling_weight  # Weight for sensor coupling loss
+        
+        # Import coupled sensors information for relationship-aware loss
+        try:
+            from src.data_processing.damage_mappings import COUPLED_SENSORS
+            # Convert AN3-AN10 format to 0-7 indices
+            self.coupled_groups = []
+            for group in COUPLED_SENSORS:
+                indices = [int(s[2:]) - 3 for s in group if int(s[2:]) - 3 < num_sensors]
+                if len(indices) > 1:  # Only include groups with multiple sensors
+                    self.coupled_groups.append(indices)
+        except ImportError:
+            self.coupled_groups = []
     
     def forward(self, outputs, targets):
         fault_detection = outputs['fault_detection'].squeeze()
@@ -96,7 +108,7 @@ class FaultLocalizationLoss(nn.Module):
             target_values = torch.ones_like(sorted_anomalies)
             for i in range(self.num_sensors):
                 # Sigmoid-like decay for more realistic targeting
-                decay_factor = 1.0 / (1.0 + torch.exp(torch.tensor(2.5 * (i - k + 1)).float()))
+                decay_factor = 1.0 / (1.0 + torch.exp(2.5 * (i - k + 1)))
                 target_values[:, i] = 0.15 + 0.8 * decay_factor  # Range from 0.95 to 0.15
             
             # Calculate loss with emphasis on correctly ranking the sensors
@@ -115,11 +127,28 @@ class FaultLocalizationLoss(nn.Module):
             # More aggressive variance encouragement
             variance_penalty = -torch.var(ensemble_faulty, dim=1).mean() * 0.5
             
+            # Add coupling loss to ensure related sensors show similar anomaly patterns
+            coupling_loss = torch.tensor(0.0).to(fault_detection.device)
+            
+            if self.coupled_groups:
+                for group in self.coupled_groups:
+                    for i in range(len(group)):
+                        for j in range(i+1, len(group)):
+                            # Encourage coupled sensors to have similar anomaly values
+                            idx1, idx2 = group[i], group[j]
+                            if idx1 < ensemble_faulty.size(1) and idx2 < ensemble_faulty.size(1):
+                                # Use L1 to measure difference between coupled sensors
+                                coupling_loss += F.l1_loss(
+                                    ensemble_faulty[:, idx1], 
+                                    ensemble_faulty[:, idx2]
+                                )
+            
             # Combined loss components with tuned weights
             faulty_loss = (
                 2.0 * faulty_bce +                    # Basic BCE with targets
                 0.5 * ranking_loss +                  # Ensure proper ranking
-                variance_penalty                     # Encourage diversity
+                variance_penalty +                    # Encourage diversity
+                self.sensor_coupling_weight * coupling_loss  # Related sensors should behave similarly
             )
             
             # Add consistency loss between joint and traditional predictions
@@ -568,7 +597,8 @@ def train(model, train_loader, val_loader, config):
         num_sensors=8,  # Number of sensors in the data
         min_faulty_sensors=3,  # Minimum number of sensors expected to show anomalies
         focal_gamma=config.focal_gamma,
-        pos_weight=config.pos_weight
+        pos_weight=config.pos_weight,
+        sensor_coupling_weight=config.sensor_coupling_weight
     )
     
     optimizer = torch.optim.Adam(

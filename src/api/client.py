@@ -111,7 +111,23 @@ class FederatedClient:
         self.convergence_rate = np.random.uniform(0.8, 1.2)  # How quickly this client converges
         self.regularization_strength = np.random.uniform(0.8e-4, 1.5e-4)  # Client-specific regularization
         
+        # Add operating condition awareness for domain adaptation
+        self.operating_conditions = {
+            "rpm_range": np.random.uniform(1000, 2000),
+            "load_profile": np.random.choice(["high", "medium", "low"]),
+            "environment": np.random.choice(["normal", "dusty", "humid"])
+        }
+        
+        # Track client's specialty for better contribution in certain damage types
+        self.specialized_damage_types = np.random.choice(
+            ["ring_gear", "high_speed", "bearings", "low_speed"], 
+            size=np.random.randint(1, 3),  # Each client specializes in 1-2 damage types
+            replace=False
+        )
+        
         print(f"Client {client_id} initialized with data quality {self.data_quality:.2f}")
+        print(f"Operating conditions: {self.operating_conditions}")
+        print(f"Specialized in: {self.specialized_damage_types}")
         
         self.load_data()
     
@@ -217,26 +233,61 @@ class FederatedClient:
         self.has_location_labels = True
     
     def receive_model(self, model_state):
-        """Receive model from server"""
+        """Receive model from server with improved transfer learning"""
         print(f"[{self.client_id} received global model]")
         if self.model is None:
             self.model = GearboxCNN(dropout_rate=0.3).to(self.device)
         
-        # Load the model state
+        # Store previous local knowledge (before applying global model)
+        local_knowledge = {}
+        if hasattr(self.model, 'sensor_anomaly_heads') and hasattr(self.model, 'fault_detector'):
+            # Save local knowledge from key layers that should preserve client adaptation
+            with torch.no_grad():
+                for name, param in self.model.named_parameters():
+                    # Focus on client-specific knowledge in output layers
+                    if ('sensor_anomaly_heads' in name or 'fault_detector' in name or 
+                        'anomaly_calibration' in name or 'joint_anomaly_head' in name):
+                        local_knowledge[name] = param.clone()
+        
+        # Load the global model state
         self.model.load_state_dict(model_state)
         
-        # Introduce realistic model personalization/drift
-        # This simulates how each client might slightly modify weights based on local conditions
+        # Apply domain adaptation based on operating conditions and specialties
         with torch.no_grad():
+            # Apply personalization for client-specific adaptation
             for name, param in self.model.named_parameters():
-                # Skip batch norm parameters to maintain stability
-                if 'norm' not in name:
+                # 1. Restore partial local knowledge in output layers (preserve client adaptations)
+                if name in local_knowledge:
+                    # Blend global and local knowledge (70% global, 30% local)
+                    param.data = 0.7 * param.data + 0.3 * local_knowledge[name]
+                
+                # 2. Apply condition-specific adaptation to relevant layers
+                if 'sensor_relationship_matrix' in name:
+                    # Adjust relationship matrix based on client's specialization
+                    for specialty in self.specialized_damage_types:
+                        if specialty == "ring_gear":
+                            # Strengthen ring gear relationships (AN3-AN4 are indices 0-1)
+                            param.data[0, 1] *= 1.2
+                            param.data[1, 0] *= 1.2
+                        elif specialty == "high_speed":
+                            # Strengthen high-speed section (AN7-AN9 are indices 4-6)
+                            for i in range(4, 7):
+                                for j in range(4, 7):
+                                    if i != j:
+                                        param.data[i, j] *= 1.2
+                
+                # 3. Add minimal noise for other parameters (avoids exact convergence)
+                if 'norm' not in name and name not in local_knowledge:
                     # Add small Gaussian noise to model weights (simulates local adaptation)
-                    drift_factor = np.random.uniform(0.001, 0.01)
+                    drift_factor = np.random.uniform(0.0005, 0.005)  # Reduced from original
                     param.add_(torch.randn_like(param) * drift_factor)
+        
+        # Add client-specific operating condition embedding if model supports it
+        if hasattr(self.model, 'set_operating_conditions'):
+            self.model.set_operating_conditions(self.operating_conditions)
     
     def train(self, config=None):
-        """Train the local model"""
+        """Train the local model with transfer learning enhancements"""
         print(f"[{self.client_id} starting training]")
         
         # Create client-specific config based on convergence rate and regularization
@@ -245,31 +296,81 @@ class FederatedClient:
                 'batch_size': 32,
                 'learning_rate': 0.001 * self.convergence_rate,  # Client-specific learning rate
                 'weight_decay': self.regularization_strength,  # Client-specific regularization
-                'num_epochs': int(5 * (1.0 / self.convergence_rate)),  # Faster clients need fewer epochs
-                'device': self.device
+                'num_epochs': int(10 * (1.0 / self.convergence_rate)),  # Faster clients need fewer epochs
+                'patience': 5,  # Add early stopping patience
+                'device': self.device,
+                'sensor_coupling_weight': 0.3,  # Default value for sensor coupling loss
+                'transfer_learning': True  # Enable transfer learning
             }
         
-        # Enable Monte Carlo dropout for more realistic evaluation
-        self.model.enable_mc_dropout()
+        # Add operating conditions to the config
+        config['operating_conditions'] = self.operating_conditions
         
-        trained_model, metrics = train_client(
-            self.model, 
-            self.X_train, 
-            self.y_train,
-            self.X_val,
-            self.y_val,
-            self.loc_train,
-            self.loc_val,
-            config
-        )
+        # Selective fine-tuning based on transfer learning principles
+        if config.get('transfer_learning', False):
+            # First freeze the feature extraction layers to preserve global knowledge
+            for name, param in self.model.named_parameters():
+                if any(x in name for x in ['sensor_cnns', 'lstm', 'rpm_cnn', 'freq_extractors']):
+                    param.requires_grad = False
+                else:
+                    param.requires_grad = True
+                    
+            # Train for a few epochs with frozen feature extractors
+            trained_model, _ = train_client(
+                self.model, 
+                self.X_train, 
+                self.y_train,
+                self.X_val,
+                self.y_val,
+                self.loc_train,
+                self.loc_val,
+                {**config, 'num_epochs': max(1, int(config['num_epochs'] * 0.3))}
+            )
+            
+            # Then unfreeze all layers for fine-tuning with lower learning rate
+            for param in trained_model.parameters():
+                param.requires_grad = True
+                
+            config['learning_rate'] = config['learning_rate'] * 0.5
+            
+            # Enable Monte Carlo dropout for more realistic evaluation
+            trained_model.enable_mc_dropout()
+            
+            # Continue training with all layers unfrozen
+            trained_model, metrics = train_client(
+                trained_model, 
+                self.X_train, 
+                self.y_train,
+                self.X_val,
+                self.y_val,
+                self.loc_train,
+                self.loc_val,
+                {**config, 'num_epochs': max(1, int(config['num_epochs'] * 0.7))}
+            )
+        else:
+            # Standard training without transfer learning
+            self.model.enable_mc_dropout()
+            
+            trained_model, metrics = train_client(
+                self.model, 
+                self.X_train, 
+                self.y_train,
+                self.X_val,
+                self.y_val,
+                self.loc_train,
+                self.loc_val,
+                config
+            )
         
         # Disable Monte Carlo dropout after training
-        self.model.disable_mc_dropout()
+        trained_model.disable_mc_dropout()
         
         print(f"[{self.client_id} completed training]")
         
-        # Add client-specific metrics
+        # Add client-specific metadata to metrics
         metrics['data_quality'] = self.data_quality
         metrics['convergence_rate'] = self.convergence_rate
+        metrics['operating_conditions'] = self.operating_conditions
+        metrics['specialized_damage_types'] = self.specialized_damage_types
         
         return trained_model, metrics 

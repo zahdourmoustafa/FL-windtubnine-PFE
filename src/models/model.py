@@ -1,6 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
+
+# Import coupled sensors from damage mappings
+from src.data_processing.damage_mappings import COUPLED_SENSORS
 
 class GearboxCNNLSTM(nn.Module):
     def __init__(self, input_channels=9, window_size=256, lstm_hidden_size=32, num_lstm_layers=1, num_sensors=8, dropout_rate=0.3):
@@ -11,6 +15,12 @@ class GearboxCNNLSTM(nn.Module):
         self.mc_dropout = False  # Flag for Monte Carlo dropout during inference
         self.lstm_hidden_size = lstm_hidden_size
         
+        # Remove sensor relationship matrix - each sensor will be independent
+        
+        # Physical frequency bands for gear mesh frequencies and their harmonics
+        # Used to enhance feature extraction with domain knowledge
+        self.gear_mesh_frequencies = [152.3, 789.5, 2340.7]  # Hz
+        
         # Sensor-specific feature extraction
         self.sensor_cnns = nn.ModuleList([
             nn.Sequential(
@@ -18,6 +28,19 @@ class GearboxCNNLSTM(nn.Module):
                 nn.BatchNorm1d(8),
                 nn.ReLU(),
                 nn.Dropout(dropout_rate/2),  # Add dropout to CNNs
+                nn.MaxPool1d(4)
+            ) for _ in range(num_sensors)
+        ])
+        
+        # Enhanced frequency-domain feature extraction
+        self.freq_extractors = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(1, 4, kernel_size=7, padding=3),  # Wider kernel for better frequency resolution
+                nn.BatchNorm1d(4),
+                nn.ReLU(),
+                nn.Conv1d(4, 4, kernel_size=3, padding=1, groups=4),  # Depthwise conv for feature refinement
+                nn.BatchNorm1d(4),
+                nn.ReLU(),
                 nn.MaxPool1d(4)
             ) for _ in range(num_sensors)
         ])
@@ -67,28 +90,20 @@ class GearboxCNNLSTM(nn.Module):
             nn.Linear(32, 1)
         )
         
-        # Cross-sensor interaction layer to model dependencies between sensors
-        self.cross_sensor_interaction = nn.Sequential(
-            nn.Linear(num_sensors * 8 * 16, 128),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(128, 64)
-        )
-        
         # Individual sensor feature extractors
         self.sensor_feature_extractors = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(8 * 16, 32),
+                nn.LayerNorm(32),  # Added layer norm
                 nn.ReLU(),
                 nn.Dropout(dropout_rate/2)
             ) for _ in range(num_sensors)
         ])
         
-        # Improved sensor anomaly detection heads with cross-sensor attention
+        # Independent sensor anomaly detection heads
         self.sensor_anomaly_heads = nn.ModuleList([
             nn.Sequential(
-                # Input: Global context + sensor-specific features + global sensor interaction features
-                nn.Linear(lstm_hidden_size*2 + 32 + 64, 64),
+                nn.Linear(lstm_hidden_size*2 + 32, 64),  # Reduced input size (removed global sensor info)
                 nn.ReLU(),
                 nn.Dropout(dropout_rate),
                 nn.Linear(64, 32),
@@ -106,7 +121,7 @@ class GearboxCNNLSTM(nn.Module):
             nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
-        elif isinstance(m, nn.BatchNorm1d):
+        elif isinstance(m, (nn.BatchNorm1d, nn.LayerNorm)):
             nn.init.constant_(m.weight, 1)
             nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LSTM):
@@ -142,14 +157,20 @@ class GearboxCNNLSTM(nn.Module):
         sensor_features = []
         sensor_attentions = []
         raw_sensor_features = []  # Store raw sensor features for anomaly detection
+        freq_features = []  # Store frequency domain features
         
         for i in range(self.num_sensors):
             # Extract single sensor data and reshape
             single_sensor = sensor_data[:, :, i:i+1].permute(0, 2, 1)  # (batch_size, 1, time_steps)
             
-            # Apply sensor-specific CNN
+            # Apply sensor-specific CNN for time-domain features
             sensor_feat = self.sensor_cnns[i](single_sensor)
             sensor_feat = self.adaptive_pool(sensor_feat)  # (batch_size, 8, 16)
+            
+            # Apply frequency-domain feature extraction
+            freq_feat = self.freq_extractors[i](single_sensor)
+            freq_feat = self.adaptive_pool(freq_feat)  # (batch_size, 4, 16)
+            freq_features.append(freq_feat.view(batch_size, -1))
             
             # Store raw features for later use in anomaly detection
             flat_feat = sensor_feat.view(batch_size, -1)
@@ -198,26 +219,30 @@ class GearboxCNNLSTM(nn.Module):
             extractor(raw_feat) for extractor, raw_feat in zip(self.sensor_feature_extractors, raw_sensor_features)
         ]
         
-        # Cross-sensor interaction - concatenate all raw sensor features and extract global patterns
-        all_sensor_features = torch.cat(raw_sensor_features, dim=1)
-        global_sensor_interaction = self.cross_sensor_interaction(all_sensor_features)
+        # Remove cross-sensor interaction
+        # Instead of sharing information between sensors, each sensor will be processed independently
         
-        # Generate sensor-wise anomaly scores with more independence
-        sensor_anomalies = []
+        # Generate individual sensor anomaly scores directly without relationship modeling
+        traditional_sensor_anomalies = []
         for i in range(self.num_sensors):
-            # Combine global context with sensor-specific features and cross-sensor information
-            combined_features = torch.cat([context, sensor_specific_features[i], global_sensor_interaction], dim=1)
+            # Use only context and sensor-specific features (no cross-sensor information)
+            combined_features = torch.cat([context, sensor_specific_features[i]], dim=1)
             
             # Generate anomaly score through the sensor-specific head
             anomaly_score = self.sensor_anomaly_heads[i](combined_features)
-            sensor_anomalies.append(anomaly_score)
+            traditional_sensor_anomalies.append(anomaly_score)
         
-        # Concatenate anomaly scores for all sensors
-        sensor_anomalies = torch.cat(sensor_anomalies, dim=1)  # (batch_size, num_sensors)
+        # Concatenate traditional anomaly scores
+        traditional_sensor_anomalies = torch.cat(traditional_sensor_anomalies, dim=1)  # (batch_size, num_sensors)
+        
+        # Remove ensemble approach - use only traditional sensor-specific predictions
+        # No calibration based on cross-sensor relationships
         
         return {
             'fault_detection': fault_detection,
-            'sensor_anomalies': sensor_anomalies,  # Anomaly score for each sensor
+            'sensor_anomalies': traditional_sensor_anomalies,  # Direct sensor-specific scores
             'sensor_attention': sensor_attentions,  # How much attention each sensor gets
-            'temporal_attention': temporal_weights  # How important each timestep is
+            'temporal_attention': temporal_weights,  # How important each timestep is
+            'joint_anomalies': traditional_sensor_anomalies,  # For backward compatibility
+            'traditional_anomalies': traditional_sensor_anomalies,  # For backward compatibility
         }

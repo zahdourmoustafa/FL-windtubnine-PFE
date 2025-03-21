@@ -40,6 +40,28 @@ The dataset is organized into two directories:
 - **AN10**: Carrier downwind radial vibration.
 - **Speed**: Rotational speed of the high-speed shaft (HSS).
 
+
+### **4. Actual Gearbox Damage**
+
+The **"damaged" gearbox** experienced two oil-loss events in the field. It was later disassembled, and a detailed failure analysis was conducted [3].  
+Table 5 summarizes the actual damage detected through vibration analysis.
+
+---
+
+### **Table 5: Actual Gearbox Damage Deemed Detectable through Vibration Analysis**
+
+| Damage # | Component                        | Mode                                         |
+| -------- | -------------------------------- | -------------------------------------------- |
+| 1        | HS-ST gear set                   | Scuffing                                     |
+| 2        | HS-SH downwind bearings          | Overheating                                  |
+| 3        | IMS-ST gear set                  | Fretting corrosion, scuffing, polishing wear |
+| 4        | IMS-SH upwind bearing            | Assembly damage, scuffing, dents             |
+| 5        | IMS-SH downwind bearings         | Assembly damage, dents                       |
+| 6        | Annulus/ring gear, or sun pinion | Scuffing and polishing, fretting corrosion   |
+| 7        | Planet carrier upwind bearing    | Fretting corrosion                           |
+
+---
+
 ## 🛠️ Data Preprocessing
 
 ### 1️⃣ Handling Large Data (2.4M values per sensor)
