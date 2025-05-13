@@ -7,15 +7,13 @@ import numpy as np
 from src.data_processing.damage_mappings import COUPLED_SENSORS
 
 class GearboxCNNLSTM(nn.Module):
-    def __init__(self, input_channels=9, window_size=256, lstm_hidden_size=32, num_lstm_layers=1, num_sensors=8, dropout_rate=0.3):
+    def __init__(self, window_size=256, lstm_hidden_size=32, num_lstm_layers=1, num_sensors=8, dropout_rate=0.3):
         super().__init__()
         self.num_samples = 0
         self.num_sensors = num_sensors
         self.dropout_rate = dropout_rate
         self.mc_dropout = False  # Flag for Monte Carlo dropout during inference
         self.lstm_hidden_size = lstm_hidden_size
-        
-        # Remove sensor relationship matrix - each sensor will be independent
         
         # Physical frequency bands for gear mesh frequencies and their harmonics
         # Used to enhance feature extraction with domain knowledge
@@ -45,15 +43,6 @@ class GearboxCNNLSTM(nn.Module):
             ) for _ in range(num_sensors)
         ])
         
-        # RPM processing branch
-        self.rpm_cnn = nn.Sequential(
-            nn.Conv1d(1, 8, kernel_size=5, padding=2),
-            nn.BatchNorm1d(8),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate/2),  # Add dropout to RPM processing
-            nn.MaxPool1d(4)
-        )
-        
         # Adaptive pooling for each sensor branch
         self.adaptive_pool = nn.AdaptiveMaxPool1d(16)
         
@@ -66,12 +55,14 @@ class GearboxCNNLSTM(nn.Module):
         )
         
         # LSTM for temporal analysis
+        self.lstm_input_features = 8 * num_sensors # 8 output channels from each sensor_cnn branch
         self.lstm = nn.LSTM(
-            input_size=8 * (num_sensors + 1),  # Combined features from all sensors and RPM
+            input_size=self.lstm_input_features, 
             hidden_size=lstm_hidden_size,
             num_layers=num_lstm_layers,
             bidirectional=True,
-            dropout=dropout_rate if num_lstm_layers > 1 else 0
+            dropout=dropout_rate if num_lstm_layers > 1 else 0,
+            batch_first=True # LSTM expects (batch, seq_len, features)
         )
         
         # Temporal attention
@@ -109,8 +100,7 @@ class GearboxCNNLSTM(nn.Module):
                 nn.Linear(64, 32),
                 nn.ReLU(),
                 nn.Dropout(dropout_rate/2),
-                nn.Linear(32, 1),
-                nn.Sigmoid()
+                nn.Linear(32, 1)
             ) for _ in range(num_sensors)
         ])
         
@@ -149,64 +139,68 @@ class GearboxCNNLSTM(nn.Module):
                     m.train()
             self.apply(apply_dropout_training)
         
-        # Split input into sensor data and RPM
-        sensor_data = x[:, :, :self.num_sensors]  # (batch_size, time_steps, num_sensors)
-        rpm_data = x[:, :, -1:]  # (batch_size, time_steps, 1)
+        # Sensor data is the entire input x, as RPM is removed
+        sensor_data = x  # (batch_size, time_steps, num_sensors=8)
         
-        # Process each sensor independently
-        sensor_features = []
-        sensor_attentions = []
-        raw_sensor_features = []  # Store raw sensor features for anomaly detection
-        freq_features = []  # Store frequency domain features
+        sensor_cnn_outputs = [] # Store outputs from sensor_cnns after adaptive pooling
+        raw_sensor_features_for_anomaly_heads = [] # Store features for anomaly heads (before attention)
         
         for i in range(self.num_sensors):
-            # Extract single sensor data and reshape
-            single_sensor = sensor_data[:, :, i:i+1].permute(0, 2, 1)  # (batch_size, 1, time_steps)
+            # Extract single sensor data and permute: (batch_size, 1, time_steps)
+            single_sensor = sensor_data[:, :, i:i+1].permute(0, 2, 1) 
             
             # Apply sensor-specific CNN for time-domain features
-            sensor_feat = self.sensor_cnns[i](single_sensor)
-            sensor_feat = self.adaptive_pool(sensor_feat)  # (batch_size, 8, 16)
+            # Output: (batch_size, 8 cnn_output_channels, pooled_length)
+            sensor_cnn_feat = self.sensor_cnns[i](single_sensor)
+            sensor_cnn_feat_pooled = self.adaptive_pool(sensor_cnn_feat) # (batch_size, 8, adaptive_pool_cnn_out_size)
+            sensor_cnn_outputs.append(sensor_cnn_feat_pooled)
             
-            # Apply frequency-domain feature extraction
-            freq_feat = self.freq_extractors[i](single_sensor)
-            freq_feat = self.adaptive_pool(freq_feat)  # (batch_size, 4, 16)
-            freq_features.append(freq_feat.view(batch_size, -1))
+            # Store raw pooled features for later use in anomaly detection heads
+            # These are flattened: (batch_size, 8 * adaptive_pool_cnn_out_size)
+            raw_sensor_features_for_anomaly_heads.append(sensor_cnn_feat_pooled.view(batch_size, -1))
             
-            # Store raw features for later use in anomaly detection
-            flat_feat = sensor_feat.view(batch_size, -1)
-            raw_sensor_features.append(flat_feat)
-            
-            # Calculate attention for this sensor
-            attention = self.sensor_attention(flat_feat)
-            sensor_attentions.append(attention)
-            
-            sensor_features.append(sensor_feat)
+            # Frequency-domain feature extraction (placeholder for now - not directly combined into LSTM for simplicity)
+            # freq_feat = self.freq_extractors[i](single_sensor)
+            # freq_feat_pooled = self.adaptive_pool(freq_feat) # (batch_size, 4, adaptive_pool_cnn_out_size)
+            # freq_features_list.append(freq_feat_pooled.view(batch_size, -1))
+
+        # Sensor Attention (applied to the raw_sensor_features_for_anomaly_heads)
+        sensor_attention_logits = []
+        for i in range(self.num_sensors):
+            attention_logit = self.sensor_attention(raw_sensor_features_for_anomaly_heads[i])
+            sensor_attention_logits.append(attention_logit)
         
-        # Process RPM data
-        rpm = rpm_data.permute(0, 2, 1)  # (batch_size, 1, time_steps)
-        rpm_features = self.rpm_cnn(rpm)
-        rpm_features = self.adaptive_pool(rpm_features)
+        sensor_attention_weights = F.softmax(torch.cat(sensor_attention_logits, dim=1), dim=1) # (batch_size, num_sensors)
         
-        # Combine all features with attention
-        sensor_attentions = F.softmax(torch.cat(sensor_attentions, dim=1), dim=1)
+        # Weighted combination of sensor_cnn_outputs for LSTM
+        # Each sensor_cnn_output is (batch, 8, adaptive_pool_cnn_out_size)
+        # We want to weight these and concatenate along channel dim (dim=1)
+        weighted_features_for_lstm = []
+        for i in range(self.num_sensors):
+            # Expand attention_weights to match feature dimensions for broadcasting
+            # attention_weights[:, i:i+1] is (batch_size, 1)
+            # .unsqueeze(-1) makes it (batch_size, 1, 1) to multiply with (batch_size, 8, adaptive_pool_cnn_out_size)
+            weighted_feat = sensor_cnn_outputs[i] * sensor_attention_weights[:, i:i+1].unsqueeze(-1)
+            weighted_features_for_lstm.append(weighted_feat)
         
-        # Reshape and combine features
-        all_features = []
-        for i, feat in enumerate(sensor_features):
-            weighted_feat = feat * sensor_attentions[:, i:i+1].unsqueeze(-1)
-            all_features.append(weighted_feat)
-        all_features.append(rpm_features)
+        # Concatenate along the channel dimension (dim=1)
+        # Result: (batch_size, 8 * num_sensors, adaptive_pool_cnn_out_size)
+        combined_cnn_features = torch.cat(weighted_features_for_lstm, dim=1)
         
-        combined = torch.cat(all_features, dim=1)  # (batch_size, features, time_steps)
-        combined = combined.permute(0, 2, 1)  # (batch_size, time_steps, features)
+        # Permute for LSTM: (batch_size, seq_len, features)
+        # Here, seq_len is adaptive_pool_cnn_out_size, features is 8 * num_sensors
+        lstm_input = combined_cnn_features.permute(0, 2, 1) # (batch_size, adaptive_pool_cnn_out_size, 8*num_sensors)
         
         # LSTM processing
-        lstm_out, _ = self.lstm(combined)
+        # lstm_out: (batch_size, seq_len = adaptive_pool_cnn_out_size, lstm_hidden_size*2)
+        lstm_out, _ = self.lstm(lstm_input)
         
-        # Apply temporal attention
-        temporal_weights = self.temporal_attention(lstm_out)
-        temporal_weights = F.softmax(temporal_weights, dim=1)
-        context = torch.sum(temporal_weights * lstm_out, dim=1)
+        # Apply temporal attention to LSTM output
+        # temporal_weights: (batch_size, seq_len = adaptive_pool_cnn_out_size, 1)
+        temporal_weights = self.temporal_attention(lstm_out) 
+        temporal_weights_softmax = F.softmax(temporal_weights, dim=1)
+        # context: (batch_size, lstm_hidden_size*2)
+        context = torch.sum(temporal_weights_softmax * lstm_out, dim=1)
         
         # Generate predictions for fault detection
         fault_detection = self.fault_detector(context)
@@ -214,35 +208,26 @@ class GearboxCNNLSTM(nn.Module):
         if not self.training and not self.mc_dropout:
             fault_detection = torch.sigmoid(fault_detection)
         
-        # Process raw sensor features with individual extractors
-        sensor_specific_features = [
-            extractor(raw_feat) for extractor, raw_feat in zip(self.sensor_feature_extractors, raw_sensor_features)
+        # Process raw_sensor_features_for_anomaly_heads with individual extractors
+        sensor_specific_features_for_anomaly_heads = [
+            extractor(raw_feat) for extractor, raw_feat in zip(self.sensor_feature_extractors, raw_sensor_features_for_anomaly_heads)
         ]
         
-        # Remove cross-sensor interaction
-        # Instead of sharing information between sensors, each sensor will be processed independently
-        
-        # Generate individual sensor anomaly scores directly without relationship modeling
-        traditional_sensor_anomalies = []
+        # Generate individual sensor anomaly scores
+        sensor_anomaly_scores = []
         for i in range(self.num_sensors):
-            # Use only context and sensor-specific features (no cross-sensor information)
-            combined_features = torch.cat([context, sensor_specific_features[i]], dim=1)
-            
-            # Generate anomaly score through the sensor-specific head
-            anomaly_score = self.sensor_anomaly_heads[i](combined_features)
-            traditional_sensor_anomalies.append(anomaly_score)
+            # Concatenate LSTM context with sensor-specific features
+            combined_features_for_head = torch.cat([context, sensor_specific_features_for_anomaly_heads[i]], dim=1)
+            anomaly_score = self.sensor_anomaly_heads[i](combined_features_for_head)
+            sensor_anomaly_scores.append(anomaly_score)
         
-        # Concatenate traditional anomaly scores
-        traditional_sensor_anomalies = torch.cat(traditional_sensor_anomalies, dim=1)  # (batch_size, num_sensors)
-        
-        # Remove ensemble approach - use only traditional sensor-specific predictions
-        # No calibration based on cross-sensor relationships
+        sensor_anomaly_scores_cat = torch.cat(sensor_anomaly_scores, dim=1)  # (batch_size, num_sensors)
         
         return {
             'fault_detection': fault_detection,
-            'sensor_anomalies': traditional_sensor_anomalies,  # Direct sensor-specific scores
-            'sensor_attention': sensor_attentions,  # How much attention each sensor gets
-            'temporal_attention': temporal_weights,  # How important each timestep is
-            'joint_anomalies': traditional_sensor_anomalies,  # For backward compatibility
-            'traditional_anomalies': traditional_sensor_anomalies,  # For backward compatibility
+            'sensor_anomalies': sensor_anomaly_scores_cat,  # These are NOW LOGITS
+            'sensor_attention': sensor_attention_weights, 
+            'temporal_attention': temporal_weights_softmax, 
+            'joint_anomalies': sensor_anomaly_scores_cat, 
+            'traditional_anomalies': sensor_anomaly_scores_cat, 
         }

@@ -16,7 +16,7 @@ class FederatedServer:
         self.clients = []
         
         # Initialize or load global model
-        save_dir = os.path.join(OUTPUT_PATH, 'models')
+        save_dir = os.path.join(BASE_DIR, 'models')
         model_path = os.path.join(save_dir, 'global_model.pt')
         
         self.global_model = GearboxCNN().to(self.device)
@@ -284,7 +284,7 @@ class FederatedServer:
     
     def save_model(self):
         """Save/Update the global model"""
-        save_dir = os.path.join(OUTPUT_PATH, 'models')
+        save_dir = os.path.join(BASE_DIR, 'models')
         os.makedirs(save_dir, exist_ok=True)
         save_path = os.path.join(save_dir, 'global_model.pt')
         torch.save(self.global_model.state_dict(), save_path)
@@ -314,7 +314,7 @@ class FederatedServer:
                 # Print sensor anomaly details
                 print("\nSensor Anomaly Details:")
                 for sensor, sensor_metrics in metrics['sensor_metrics'].items():
-                    print(f"{sensor}: Mean Anomaly = {sensor_metrics['mean_anomaly']:.4f}, AUC = {sensor_metrics['anomaly_auc']:.4f}")
+                    print(f"{sensor}: Mean Anomaly = {sensor_metrics['faulty_anomaly_mean']:.4f}, AUC = {sensor_metrics['auc']:.4f}")
             
             # Aggregate models and update global model
             self.global_model = self.aggregate_models(client_models, metrics_list)

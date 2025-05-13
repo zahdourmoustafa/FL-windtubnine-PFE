@@ -86,7 +86,7 @@ def train_client(model, X_train, y_train, X_val, y_val, loc_train=None, loc_val=
             best_metrics = {
                 'val_loss': val_metrics['total_loss'],
                 'detection_auc': val_metrics['detection_auc'],
-                'sensor_metrics': val_metrics['sensor_metrics']
+                'sensor_metrics': val_metrics['multi_sensor_metrics_original_eval']['sensor_metrics']
             }
         
         print(f"Epoch {epoch+1}/{config['num_epochs']}")

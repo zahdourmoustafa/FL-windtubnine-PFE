@@ -19,6 +19,7 @@ from tabulate import tabulate
 from termcolor import colored
 import time
 import scipy.io as sio
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix as sk_confusion_matrix
 
 # Add project root to Python path to allow importing from other modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -503,6 +504,183 @@ class GearboxDamageDetector:
         except Exception as e:
             print(f"Error saving JSON results: {e}")
 
+    def _enhance_damage_detection(self, result, enhanced_mode=False, all_sensors_mode=False):
+        """
+        Apply additional processing to enhance damage detection for subtle issues.
+        
+        Args:
+            result: Original analysis result
+            enhanced_mode: Whether to use extra sensitive detection
+            all_sensors_mode: If True, detect subtle damage patterns in all sensors
+            
+        Returns:
+            Enhanced result with potentially more detected anomalies
+        """
+        if "error" in result or not result:
+            return result
+        
+        # Copy the result to avoid modifying the original
+        enhanced = dict(result)
+        
+        # Get all sensor anomalies for analysis
+        anomalies = enhanced["sensor_anomalies"]
+        
+        # Original damaged sensors
+        original_damaged = set(enhanced["damaged_sensors"])
+        
+        # Calculate baseline statistics from anomaly scores
+        scores = list(anomalies.values())
+        mean_score = sum(scores) / len(scores) if scores else 0.0
+        std_dev = (sum((x - mean_score) ** 2 for x in scores) / len(scores)) ** 0.5 if scores else 0.0
+        
+        # IMPROVED AUTO-DETECTION: Automatically determine if this is a heavily damaged system
+        # without requiring the all_sensors flag
+        overall_fault_prob = enhanced["overall_fault_probability"]
+        high_score_count = sum(1 for score in scores if score > 0.5)
+        medium_score_count = sum(1 for score in scores if 0.3 <= score < 0.5)
+        low_score_count = sum(1 for score in scores if 0.05 <= score < 0.3)
+        
+        # Define damage patterns based on scores and overall probability
+        is_heavily_damaged = False
+        auto_all_sensors = False
+        
+        # Pattern 1: High fault probability with multiple high scores
+        if overall_fault_prob > 0.6 and high_score_count >= 2:
+            is_heavily_damaged = True
+            
+            # If several sensors also show medium/low-level activity, likely all are affected
+            if (medium_score_count + low_score_count) >= 3 and overall_fault_prob > 0.7:
+                auto_all_sensors = True
+            # Special pattern for cases like unseenD.mat with multiple very high scores
+            elif high_score_count >= 3 and overall_fault_prob > 0.75:
+                auto_all_sensors = True
+        
+        # Pattern 2: Very high fault probability with spread of anomaly scores (variance)
+        elif overall_fault_prob > 0.7 and std_dev > 0.2:
+            is_heavily_damaged = True
+            
+            # If the mean score is quite high, likely all sensors have some level of damage
+            if mean_score > 0.3:
+                auto_all_sensors = True
+        
+        # Handle all_sensors mode (either from flag or auto-detection)
+        if all_sensors_mode or auto_all_sensors:
+            # For cases with damage patterns in all sensors
+            # Find the minimum non-zero anomaly score as a reference
+            min_nonzero_score = min([s for s in scores if s > 0.05]) if any(s > 0.05 for s in scores) else 0.05
+            
+            # Set threshold to detect all sensors with any meaningful signal
+            min_valid_threshold = min(0.2, min_nonzero_score * 1.1)
+            statistical_threshold = min_valid_threshold  # Keep this for reporting
+            
+            # For auto-detected all-sensors mode or explicitly requested mode with high fault probability
+            if (auto_all_sensors or all_sensors_mode) and overall_fault_prob > 0.65:
+                # Use extremely sensitive detection
+                for sensor, score in anomalies.items():
+                    if score > 0:  # Any non-zero score indicates potential subtle damage
+                        enhanced["is_damaged"][sensor] = True
+                
+                # Update damaged sensors list
+                enhanced["damaged_sensors"] = [s for s, d in enhanced["is_damaged"].items() if d]
+                enhanced["num_anomalies"] = len(enhanced["damaged_sensors"])
+                
+                # Skip the rest of the processing
+                enhanced["validation"] = {
+                    "mean_score": mean_score,
+                    "std_dev": std_dev,
+                    "statistical_threshold": statistical_threshold,
+                    "min_valid_threshold": min_valid_threshold,
+                    "validated_sensors": [],
+                    "added_sensors": list(enhanced["damaged_sensors"]),
+                    "is_heavily_damaged": True,
+                    "high_score_sensors": high_score_count,
+                    "all_sensors_mode": True,
+                    "auto_detected": auto_all_sensors
+                }
+                
+                # Recalculate damage analysis
+                # Convert sensor names to anomaly scores for reanalysis
+                current_anomaly_scores = np.array([anomalies.get(s, 0.0) for s in self.sensor_names])
+                enhanced["damage_analysis"] = self._analyze_damage(enhanced["damaged_sensors"], current_anomaly_scores)
+                
+                return enhanced
+        
+        # Standard processing for non-all_sensors_mode or when auto-detection didn't trigger
+        # Use different thresholds based on the situation
+        if is_heavily_damaged and high_score_count >= 2:
+            # Use a lower threshold for heavily damaged cases to catch more affected sensors
+            min_valid_threshold = 0.3  # Lower from 0.5 to 0.3 to catch more sensors
+            statistical_threshold = 0.3  # Keep this for reporting
+        else:
+            # Standard statistical approach for normal cases
+            # Use 1.5 standard deviations instead of 2 (less conservative)
+            statistical_threshold = mean_score + 1.5 * std_dev
+            
+            # Calculate minimum valid threshold
+            min_valid_threshold = max(0.3, statistical_threshold)  # Lower from 0.4 to 0.3
+        
+        # Track newly identified damaged sensors that pass validation
+        new_damaged = set()
+        validated_damaged = set()
+        
+        # Validate existing damaged sensors
+        for sensor in original_damaged:
+            score = anomalies.get(sensor, 0.0)
+            # Only keep sensors with score above the statistical threshold
+            if score >= min_valid_threshold:
+                validated_damaged.add(sensor)
+        
+        # Consider additional sensors
+        for sensor, score in anomalies.items():
+            # Don't double-count already validated sensors
+            if sensor not in validated_damaged:
+                if is_heavily_damaged:
+                    # For heavily damaged cases, use more aggressive detection
+                    if score >= min_valid_threshold:
+                        new_damaged.add(sensor)
+                        enhanced["is_damaged"][sensor] = True
+                elif enhanced_mode:
+                    # Normal enhanced mode for non-heavily damaged cases
+                    if score >= min_valid_threshold:
+                        new_damaged.add(sensor)
+                        enhanced["is_damaged"][sensor] = True
+        
+        # Update the list of damaged sensors - only include validated ones
+        all_damaged = validated_damaged.union(new_damaged)
+        enhanced["damaged_sensors"] = list(all_damaged)
+        
+        # Update damage status for any sensors that didn't pass validation
+        for sensor in list(enhanced["is_damaged"].keys()): # Iterate over copy of keys
+            if sensor not in all_damaged:
+                enhanced["is_damaged"][sensor] = False
+        
+        # Update number of anomalies
+        enhanced["num_anomalies"] = len(all_damaged)
+        
+        # Add validation information
+        enhanced["validation"] = {
+            "mean_score": mean_score,
+            "std_dev": std_dev,
+            "statistical_threshold": statistical_threshold,
+            "min_valid_threshold": min_valid_threshold,
+            "validated_sensors": list(validated_damaged),
+            "added_sensors": list(new_damaged),
+            "is_heavily_damaged": is_heavily_damaged,
+            "high_score_sensors": high_score_count,
+            "auto_all_sensors": auto_all_sensors
+        }
+        
+        # Recalculate damage analysis if needed
+        if all_damaged:
+            # Convert sensor names to anomaly scores for reanalysis
+            current_anomaly_scores = np.array([anomalies.get(s, 0.0) for s in self.sensor_names])
+            enhanced["damage_analysis"] = self._analyze_damage(enhanced["damaged_sensors"], current_anomaly_scores)
+        else:
+            # Clear damage analysis if no valid damages
+            enhanced["damage_analysis"] = []
+            
+        return enhanced
+
 def format_results_for_display(results):
     """Format results for console display"""
     if "error" in results:
@@ -618,6 +796,16 @@ def format_results_for_display(results):
         if "auto_all_sensors" in validation:
             output.append(f"  Auto-detected all sensors damage: {validation['auto_all_sensors']}")
     
+    # Display correctness if ground truth is available
+    if 'y_true_overall_fault' in results:
+        is_correct = results['overall_fault_detected'] == results['y_true_overall_fault']
+        correctness_str = colored("Correct", "green") if is_correct else colored("Incorrect", "red")
+        output.append(f"Prediction Correctness: {correctness_str} (True: {results['y_true_overall_fault']}, Predicted: {results['overall_fault_detected']})")
+
+    # Display sensor state accuracy if available
+    if 'sensor_state_accuracy' in results:
+        output.append(f"Sensor State Accuracy: {results['sensor_state_accuracy']*100:.2f}% ({results['correct_sensor_predictions']}/{results['total_sensors_for_gt']} sensors correct)")
+
     return "\n".join(output)
 
 def process_unseen_data(dataset_path, output_format='text', output_dir=None, model_path=None, 
@@ -642,6 +830,10 @@ def process_unseen_data(dataset_path, output_format='text', output_dir=None, mod
     
     Returns:
         Dictionary with results for each processed file
+        List of all true labels (if ground truth available)
+        List of all predicted labels (if ground truth available)
+        Total correct sensor state predictions
+        Total sensor state predictions made
     """
     # Create output directory if it doesn't exist
     if output_dir and not os.path.exists(output_dir):
@@ -656,6 +848,12 @@ def process_unseen_data(dataset_path, output_format='text', output_dir=None, mod
         use_mc_dropout=use_mc_dropout
     )
     
+    all_true_labels = []
+    all_predicted_labels = []
+    
+    total_correct_sensor_state_predictions = 0
+    total_sensor_state_predictions_made = 0
+    
     # Process a single file if dataset_path is a file
     if os.path.isfile(dataset_path):
         files_to_process = [dataset_path]
@@ -665,7 +863,7 @@ def process_unseen_data(dataset_path, output_format='text', output_dir=None, mod
                            if f.endswith('.mat')]
     else:
         print(f"Error: {dataset_path} is not a valid file or directory.")
-        return {}
+        return {}, [], [], 0, 0
     
     results = {}
     
@@ -675,9 +873,38 @@ def process_unseen_data(dataset_path, output_format='text', output_dir=None, mod
             # Process the file
             result = detector.process_file(file_path)
             
+            # Determine dataset key from filename (e.g., "unseenD.mat" -> "unseenD")
+            base_filename = os.path.splitext(os.path.basename(file_path))[0]
+            
+            if base_filename in SENSOR_GROUND_TRUTH:
+                gt_sensors = SENSOR_GROUND_TRUTH[base_filename]
+                y_true_overall_fault = 1 if any(status == 1 for status in gt_sensors.values()) else 0
+                result['y_true_overall_fault'] = y_true_overall_fault
+                
+                all_true_labels.append(y_true_overall_fault)
+                all_predicted_labels.append(result['overall_fault_detected'])
+
+                # Calculate sensor-specific accuracy for this file
+                current_file_correct_sensor_preds = 0
+                current_file_total_sensors_for_gt = 0
+                for sensor_name, true_status in gt_sensors.items():
+                    if sensor_name in result['is_damaged']: # Ensure sensor exists in model's output scope
+                        current_file_total_sensors_for_gt += 1
+                        predicted_status = 1 if result['is_damaged'][sensor_name] else 0
+                        if predicted_status == true_status:
+                            current_file_correct_sensor_preds += 1
+                
+                if current_file_total_sensors_for_gt > 0:
+                    result['sensor_state_accuracy'] = current_file_correct_sensor_preds / current_file_total_sensors_for_gt
+                    result['correct_sensor_predictions'] = current_file_correct_sensor_preds
+                    result['total_sensors_for_gt'] = current_file_total_sensors_for_gt
+                    
+                    total_correct_sensor_state_predictions += current_file_correct_sensor_preds
+                    total_sensor_state_predictions_made += current_file_total_sensors_for_gt
+
             # ALWAYS apply enhanced detection to better identify damaged sensors
             # The algorithm will intelligently determine what level of detection to use
-            result = _enhance_damage_detection(result, enhanced_detection, all_sensors_mode)
+            result = detector._enhance_damage_detection(result, enhanced_detection, all_sensors_mode)
             
             # Format the results for display
             if output_format in ['text', 'all']:
@@ -703,195 +930,7 @@ def process_unseen_data(dataset_path, output_format='text', output_dir=None, mod
             traceback.print_exc()
             results[os.path.basename(file_path)] = {"error": str(e)}
     
-    return results
-
-def _enhance_damage_detection(result, enhanced_mode=False, all_sensors_mode=False):
-    """
-    Apply additional processing to enhance damage detection for subtle issues.
-    
-    Args:
-        result: Original analysis result
-        enhanced_mode: Whether to use extra sensitive detection
-        all_sensors_mode: If True, detect subtle damage patterns in all sensors
-        
-    Returns:
-        Enhanced result with potentially more detected anomalies
-    """
-    if "error" in result or not result:
-        return result
-    
-    # Copy the result to avoid modifying the original
-    enhanced = dict(result)
-    
-    # Get all sensor anomalies for analysis
-    anomalies = enhanced["sensor_anomalies"]
-    
-    # Original damaged sensors
-    original_damaged = set(enhanced["damaged_sensors"])
-    
-    # Calculate baseline statistics from anomaly scores
-    scores = list(anomalies.values())
-    mean_score = sum(scores) / len(scores)
-    std_dev = (sum((x - mean_score) ** 2 for x in scores) / len(scores)) ** 0.5
-    
-    # IMPROVED AUTO-DETECTION: Automatically determine if this is a heavily damaged system
-    # without requiring the all_sensors flag
-    overall_fault_prob = enhanced["overall_fault_probability"]
-    high_score_count = sum(1 for score in scores if score > 0.5)
-    medium_score_count = sum(1 for score in scores if 0.3 <= score < 0.5)
-    low_score_count = sum(1 for score in scores if 0.05 <= score < 0.3)
-    
-    # Define damage patterns based on scores and overall probability
-    is_heavily_damaged = False
-    auto_all_sensors = False
-    
-    # Pattern 1: High fault probability with multiple high scores
-    if overall_fault_prob > 0.6 and high_score_count >= 2:
-        is_heavily_damaged = True
-        
-        # If several sensors also show medium/low-level activity, likely all are affected
-        if (medium_score_count + low_score_count) >= 3 and overall_fault_prob > 0.7:
-            auto_all_sensors = True
-        # Special pattern for cases like unseenD.mat with multiple very high scores
-        elif high_score_count >= 3 and overall_fault_prob > 0.75:
-            auto_all_sensors = True
-    
-    # Pattern 2: Very high fault probability with spread of anomaly scores (variance)
-    elif overall_fault_prob > 0.7 and std_dev > 0.2:
-        is_heavily_damaged = True
-        
-        # If the mean score is quite high, likely all sensors have some level of damage
-        if mean_score > 0.3:
-            auto_all_sensors = True
-    
-    # Handle all_sensors mode (either from flag or auto-detection)
-    if all_sensors_mode or auto_all_sensors:
-        # For cases with damage patterns in all sensors
-        # Find the minimum non-zero anomaly score as a reference
-        min_nonzero_score = min([s for s in scores if s > 0.05]) if any(s > 0.05 for s in scores) else 0.05
-        
-        # Set threshold to detect all sensors with any meaningful signal
-        min_valid_threshold = min(0.2, min_nonzero_score * 1.1)
-        statistical_threshold = min_valid_threshold  # Keep this for reporting
-        
-        # For auto-detected all-sensors mode or explicitly requested mode with high fault probability
-        if (auto_all_sensors or all_sensors_mode) and overall_fault_prob > 0.65:
-            # Use extremely sensitive detection
-            for sensor, score in anomalies.items():
-                if score > 0:  # Any non-zero score indicates potential subtle damage
-                    enhanced["is_damaged"][sensor] = True
-            
-            # Update damaged sensors list
-            enhanced["damaged_sensors"] = list(enhanced["is_damaged"].keys())
-            enhanced["num_anomalies"] = len(enhanced["damaged_sensors"])
-            
-            # Skip the rest of the processing
-            enhanced["validation"] = {
-                "mean_score": mean_score,
-                "std_dev": std_dev,
-                "statistical_threshold": statistical_threshold,
-                "min_valid_threshold": min_valid_threshold,
-                "validated_sensors": [],
-                "added_sensors": list(enhanced["is_damaged"].keys()),
-                "is_heavily_damaged": True,
-                "high_score_sensors": high_score_count,
-                "all_sensors_mode": True,
-                "auto_detected": auto_all_sensors
-            }
-            
-            # Recalculate damage analysis
-            if hasattr(GearboxDamageDetector, '_analyze_damage'):
-                # Create a detector instance to reanalyze damage
-                detector = GearboxDamageDetector()
-                
-                # Convert sensor names to anomaly scores for reanalysis
-                anomaly_scores = np.array([anomalies[s] for s in [f'AN{i}' for i in range(3, 11)]])
-                
-                # Update damage analysis
-                enhanced["damage_analysis"] = detector._analyze_damage(enhanced["damaged_sensors"], anomaly_scores)
-            
-            return enhanced
-    
-    # Standard processing for non-all_sensors_mode or when auto-detection didn't trigger
-    # Use different thresholds based on the situation
-    if is_heavily_damaged and high_score_count >= 2:
-        # Use a lower threshold for heavily damaged cases to catch more affected sensors
-        min_valid_threshold = 0.3  # Lower from 0.5 to 0.3 to catch more sensors
-        statistical_threshold = 0.3  # Keep this for reporting
-    else:
-        # Standard statistical approach for normal cases
-        # Use 1.5 standard deviations instead of 2 (less conservative)
-        statistical_threshold = mean_score + 1.5 * std_dev
-        
-        # Calculate minimum valid threshold
-        min_valid_threshold = max(0.3, statistical_threshold)  # Lower from 0.4 to 0.3
-    
-    # Track newly identified damaged sensors that pass validation
-    new_damaged = set()
-    validated_damaged = set()
-    
-    # Validate existing damaged sensors
-    for sensor in original_damaged:
-        score = anomalies[sensor]
-        # Only keep sensors with score above the statistical threshold
-        if score >= min_valid_threshold:
-            validated_damaged.add(sensor)
-    
-    # Consider additional sensors
-    for sensor, score in anomalies.items():
-        # Don't double-count already validated sensors
-        if sensor not in validated_damaged:
-            if is_heavily_damaged:
-                # For heavily damaged cases, use more aggressive detection
-                if score >= min_valid_threshold:
-                    new_damaged.add(sensor)
-                    enhanced["is_damaged"][sensor] = True
-            elif enhanced_mode:
-                # Normal enhanced mode for non-heavily damaged cases
-                if score >= min_valid_threshold:
-                    new_damaged.add(sensor)
-                    enhanced["is_damaged"][sensor] = True
-    
-    # Update the list of damaged sensors - only include validated ones
-    all_damaged = validated_damaged.union(new_damaged)
-    enhanced["damaged_sensors"] = list(all_damaged)
-    
-    # Update damage status for any sensors that didn't pass validation
-    for sensor in enhanced["is_damaged"]:
-        if sensor not in all_damaged:
-            enhanced["is_damaged"][sensor] = False
-    
-    # Update number of anomalies
-    enhanced["num_anomalies"] = len(all_damaged)
-    
-    # Add validation information
-    enhanced["validation"] = {
-        "mean_score": mean_score,
-        "std_dev": std_dev,
-        "statistical_threshold": statistical_threshold,
-        "min_valid_threshold": min_valid_threshold,
-        "validated_sensors": list(validated_damaged),
-        "added_sensors": list(new_damaged),
-        "is_heavily_damaged": is_heavily_damaged,
-        "high_score_sensors": high_score_count,
-        "auto_all_sensors": auto_all_sensors
-    }
-    
-    # Recalculate damage analysis if needed
-    if hasattr(GearboxDamageDetector, '_analyze_damage') and all_damaged:
-        # Create a detector instance to reanalyze damage
-        detector = GearboxDamageDetector()
-        
-        # Convert sensor names to anomaly scores for reanalysis
-        anomaly_scores = np.array([anomalies[s] for s in [f'AN{i}' for i in range(3, 11)]])
-        
-        # Update damage analysis
-        enhanced["damage_analysis"] = detector._analyze_damage(enhanced["damaged_sensors"], anomaly_scores)
-    else:
-        # Clear damage analysis if no valid damages
-        enhanced["damage_analysis"] = []
-        
-    return enhanced
+    return results, all_true_labels, all_predicted_labels, total_correct_sensor_state_predictions, total_sensor_state_predictions_made
 
 def main():
     """Main entry point for command line use"""
@@ -938,7 +977,7 @@ def main():
                     return
     
     # Process the data
-    process_unseen_data(
+    results, all_true_labels, all_predicted_labels, total_correct_sensor_preds, total_sensor_preds_made = process_unseen_data(
         dataset_path=dataset_path,
         output_format=args.format,
         output_dir=args.output,
@@ -951,6 +990,69 @@ def main():
         enhanced_detection=args.enhanced,
         all_sensors_mode=args.all_sensors
     )
+
+    if all_true_labels:
+        print("\n" + "="*60)
+        print(colored("AGGREGATE PERFORMANCE METRICS (Overall Fault Detection)", "cyan", attrs=["bold"]))
+        print("="*60)
+        
+        accuracy = accuracy_score(all_true_labels, all_predicted_labels)
+        precision = precision_score(all_true_labels, all_predicted_labels, zero_division=0)
+        recall = recall_score(all_true_labels, all_predicted_labels, zero_division=0)
+        f1 = f1_score(all_true_labels, all_predicted_labels, zero_division=0)
+        cm = sk_confusion_matrix(all_true_labels, all_predicted_labels)
+        
+        print(f"Accuracy:  {accuracy*100:.2f}%")
+        print(f"Precision: {precision*100:.2f}%")
+        print(f"Recall:    {recall*100:.2f}%")
+        print(f"F1 Score:  {f1*100:.2f}%")
+        
+        print("\nConfusion Matrix:")
+        # Ensure labels are appropriate for the binary case (0: Healthy, 1: Faulty)
+        # If all_true_labels or all_predicted_labels could be empty or not contain both 0 and 1,
+        # sk_confusion_matrix might default to labels=[0,1] if binary, or unique values present.
+        # For clarity, if we know it's binary 0/1:
+        cm_labels = sorted(list(set(all_true_labels) | set(all_predicted_labels)))
+        if not cm_labels: cm_labels = [0,1] # Default if no labels
+        elif len(cm_labels) == 1: cm_labels = [cm_labels[0], 1-cm_labels[0]] # Ensure two labels for binary
+        
+        # If SENSOR_GROUND_TRUTH only has entries like "unseenD" which is faulty, 
+        # and we only test with it, all_true_labels might only contain [1].
+        # We need to ensure confusion matrix handles this (e.g. by defining labels=[0,1])
+        # However, sklearn handles this if data is purely one class for y_true, but y_pred has other.
+        # If y_true and y_pred are both single class (e.g. all 1s), it will be a 1x1 matrix.
+        # For a standard 2x2, we need to ensure it knows the possible classes.
+        # Let's assume labels are 0 and 1 for healthy/faulty.
+        
+        if len(cm) == 1: # Handle case where all predictions and true labels are the same class
+            tn, fp, fn, tp = 0,0,0,0
+            if all_true_labels[0] == 0 : # All are true negatives
+                tn = cm[0][0]
+            else: # All are true positives
+                tp = cm[0][0]
+        elif len(cm) == 2:
+             tn, fp, fn, tp = cm.ravel()
+        else: # Should not happen for binary classification if labels are [0,1]
+            tn, fp, fn, tp = 0,0,0,0 
+            print(colored("Warning: Confusion matrix is not 2x2, metrics might be misleading.", "yellow"))
+            print(cm)
+
+
+        cm_table_data = [
+            ["Predicted Healthy", tn, fn],
+            ["Predicted Faulty", fp, tp]
+        ]
+        cm_headers = ["", "True Healthy", "True Faulty"]
+        print(tabulate(cm_table_data, headers=cm_headers, tablefmt="grid"))
+        print("="*60)
+
+    if total_sensor_preds_made > 0:
+        overall_sensor_state_accuracy = total_correct_sensor_preds / total_sensor_preds_made
+        print("\n" + "="*60)
+        print(colored("OVERALL SENSOR STATE ACCURACY", "cyan", attrs=["bold"]))
+        print("="*60)
+        print(f"Accuracy: {overall_sensor_state_accuracy*100:.2f}% ({total_correct_sensor_preds}/{total_sensor_preds_made} sensor states correctly predicted across all files with ground truth)")
+        print("="*60)
 
 if __name__ == "__main__":
     main()
